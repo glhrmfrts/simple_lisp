@@ -26,6 +26,7 @@
                         (Char == '+') || \
                         (Char == '*') || \
                         (Char == '/') || \
+                        (Char == '?') || \
                         (Char == '.'))
 
 #define Is(Value, T) (Value.Type == ValueType_##T)
@@ -56,6 +57,7 @@ enum sl_opcode
     OpCode_Defonce,
     OpCode_Set,
     OpCode_FuncCall,
+    OpCode_LoadBool,
     OpCode_LoadString,
     OpCode_LoadNumber,
     OpCode_LoadSymbol,
@@ -135,18 +137,21 @@ struct sl_script
 enum sl_value_type
 {
     ValueType_Nil,
+    ValueType_Bool,
     ValueType_Number,
     ValueType_String,
     ValueType_Func,
     ValueType_NativeFunc,
+    ValueType_Coroutine,
     ValueType_Custom,
     ValueTypeMax,
 };
 
 static const char *ValueTypeStrings[] = {
-    "nil", "number", "string", "func", "native_func", "custom"
+    "nil", "bool", "number", "string", "func", "native_func", "coroutine", "custom"
 };
 
+struct sl_call_frame;
 struct sl_vm;
 struct sl_value;
 
@@ -158,6 +163,12 @@ struct sl_native
     void *Data;
 };
 
+struct sl_coroutine : sl_ref
+{
+    sl_call_frame *Frame = NULL;
+    sl_func *Func = NULL;
+};
+
 struct sl_value
 {
     sl_value_type Type = ValueType_Nil;
@@ -166,8 +177,10 @@ struct sl_value
         sl_string *String;
         sl_func *Func;
         sl_native *Native;
+        sl_coroutine *Coroutine;
         void *Custom;
         float Number;
+        bool Bool;
     };
 };
 
@@ -176,6 +189,7 @@ struct sl_call_frame
 {
     sl_value Vars[MaxVars];
     uint8 *CodePtr = NULL;
+    sl_coroutine *Coroutine = NULL;
     sl_call_frame *Parent = NULL;
 };
 
@@ -184,7 +198,7 @@ struct sl_vm
     std::unordered_map<std::string, sl_value> Globals;
 
     sl_pool StringPool;
-    sl_pool ListPool;
+    sl_pool CoroutinePool;
     sl_value Stack[MaxVars];
     int StackTop = 0;
     sl_call_frame *CurrentFrame = NULL;
@@ -587,8 +601,19 @@ static void ParseExpr(sl_script *Script, sl_code *Code, sl_lexer *Lexer, bool Po
 
     case TokenType_Symbol:
     {
-        int StrIndex = AddString(Script, Lexer->StringVal, Lexer->StringSize);
-        Emit(Code, OpCode_LoadSymbol, (uint8)StrIndex);
+        if (strcmp("true", Lexer->StringVal) == 0)
+        {
+            Emit(Code, OpCode_LoadBool, 1);
+        }
+        else if (strcmp("false", Lexer->StringVal) == 0)
+        {
+            Emit(Code, OpCode_LoadBool);
+        }
+        else
+        {
+            int StrIndex = AddString(Script, Lexer->StringVal, Lexer->StringSize);
+            Emit(Code, OpCode_LoadSymbol, (uint8)StrIndex);
+        }
         NextToken(Lexer);
         break;
     }
@@ -640,6 +665,10 @@ static void DisasmCode(sl_script *Script, sl_code *Code, int Indent = 0)
 
         case OpCode_FuncCall:
             printf("FuncCall args:%d", Arg);
+            break;
+
+        case OpCode_LoadBool:
+            printf("LoadBool %d", Arg);
             break;
 
         case OpCode_LoadString:
@@ -827,6 +856,14 @@ inline sl_value CreateNumber(float Number)
     return Result;
 }
 
+inline sl_value CreateBool(bool Value)
+{
+    sl_value Result;
+    Result.Type = ValueType_Bool;
+    Result.Bool = Value;
+    return Result;
+}
+
 inline sl_value CreateString(sl_vm *Vm, char *Value, int Size)
 {
     sl_string *Str = (sl_string *)GetObject(&Vm->StringPool);
@@ -848,20 +885,21 @@ inline sl_value CreateCustom(void *Custom)
     return Result;
 }
 
-static void PushCallFrame(sl_vm *Vm, uint8 *Code)
+inline void PushCallFrame(sl_vm *Vm, uint8 *Code, sl_coroutine *Co = NULL)
 {
     sl_call_frame *Frame = new sl_call_frame;
     Frame->CodePtr = Code;
     Frame->Parent = Vm->CurrentFrame;
+    Frame->Coroutine = Co;
     Vm->CurrentFrame = Frame;
 }
 
-static void StackPush(sl_vm *Vm, sl_value Value)
+inline void StackPush(sl_vm *Vm, sl_value Value)
 {
     Vm->Stack[Vm->StackTop++] = Value;
 }
 
-static sl_value StackPop(sl_vm *Vm)
+inline sl_value StackPop(sl_vm *Vm)
 {
     if (Vm->StackTop > 0)
     {
@@ -881,9 +919,16 @@ void RegisterNativeFunc(sl_vm *Vm, const std::string &Name, native_func *Func, v
     Vm->Globals[Name] = Value;
 }
 
-void Execute(sl_vm *Vm, sl_script *Script, sl_code *Code, bool StopOnReturn = false)
+void Execute(sl_vm *Vm, sl_script *Script, sl_code *Code, bool StopOnReturn = false, sl_coroutine *Co = NULL)
 {
-    PushCallFrame(Vm, Code->Data);
+    if (Co && Co->Frame)
+    {
+        Vm->CurrentFrame = Co->Frame;
+    }
+    else
+    {
+        PushCallFrame(Vm, Code->Data, Co);
+    }
     for (;;)
     {
         sl_call_frame *Frame = Vm->CurrentFrame;
@@ -934,6 +979,15 @@ void Execute(sl_vm *Vm, sl_script *Script, sl_code *Code, bool StopOnReturn = fa
             Value.Type = ValueType_Func;
             Value.Func = Script->Funcs[Arg];
             Frame->Vars[Value.Func->StringIndex] = Value;
+            break;
+        }
+
+        case OpCode_LoadBool:
+        {
+            sl_value Value;
+            Value.Type = ValueType_Bool;
+            Value.Bool = Arg == 1;
+            StackPush(Vm, Value);
             break;
         }
 
@@ -1068,6 +1122,18 @@ inline void Execute(sl_vm *Vm, sl_script *Script)
     Execute(Vm, Script, &Script->Code, false);
 }
 
+inline void CallScriptFunc(sl_vm *Vm, sl_value Value)
+{
+    if (Value.Type == ValueType_Func)
+    {
+        Execute(Vm, Vm->CurrentScript, &Value.Func->Code, true);
+    }
+    else
+    {
+        // @TODO: error
+    }
+}
+
 static long int
 GetFileSize(FILE *handle)
 {
@@ -1195,12 +1261,28 @@ NATIVE_FUNC(Println)
             printf("nil");
             break;
 
+        case ValueType_Bool:
+            if (Arg.Bool)
+            {
+                printf("true");
+            }
+            else
+            {
+                printf("false");
+            }
+            break;
+
         case ValueType_String:
             printf("%s", Arg.String->Value);
             break;
 
         case ValueType_Number:
             printf("%.4f", Arg.Number);
+            break;
+
+        case ValueType_Coroutine:
+            printf("coroutine (%s)",
+                   Vm->CurrentScript->Strings[Arg.Coroutine->Func->StringIndex].Value);
             break;
 
         default:
@@ -1214,6 +1296,7 @@ NATIVE_FUNC(Println)
         }
     }
     printf("\n");
+    StackPush(Vm, sl_value{});
 }
 
 NATIVE_FUNC(Read)
@@ -1225,13 +1308,123 @@ NATIVE_FUNC(Read)
     StackPush(Vm, CreateString(Vm, (char *)Content, (int)Size));
 }
 
+#define IsFalse(Value) ((Value.Type == ValueType_Bool && !Value.Bool) || (Value.Type == ValueType_Nil))
+NATIVE_FUNC(If)
+{
+    assert(ArgCount == 3);
+    if (!IsFalse(Args[0]))
+    {
+        CallScriptFunc(Vm, Args[1]);
+    }
+    else
+    {
+        CallScriptFunc(Vm, Args[2]);
+    }
+}
+
+NATIVE_FUNC(When)
+{
+    assert(ArgCount == 2);
+    if (!IsFalse(Args[0]))
+    {
+        CallScriptFunc(Vm, Args[1]);
+    }
+    else
+    {
+        StackPush(Vm, sl_value{});
+    }
+}
+
+NATIVE_FUNC(Coroutine)
+{
+    assert(ArgCount >= 1);
+    sl_coroutine *Co = (sl_coroutine *)GetObject(&Vm->CoroutinePool);
+    Co->Frame = NULL;
+    Co->Func = Args[0].Func;
+    InitRef(Co, &Vm->CoroutinePool);
+
+    sl_value Value;
+    Value.Type = ValueType_Coroutine;
+    Value.Coroutine = Co;
+    StackPush(Vm, Value);
+}
+
+NATIVE_FUNC(Call)
+{
+    assert(ArgCount >= 1);
+    sl_coroutine *Co = Args[0].Coroutine;
+
+    if (Co->Frame)
+    {
+        if (*(Co->Frame->CodePtr - 2) == OpCode_Return)
+        {
+            StackPush(Vm, sl_value{});
+            return;
+        }
+        else
+        {
+            if (ArgCount > 1)
+            {
+                for (int i = 1; i < ArgCount; i++)
+                {
+                    StackPush(Vm, Args[i]);
+                }
+            }
+            else
+            {
+                StackPush(Vm, sl_value{});
+            }
+        }
+    }
+    Execute(Vm, Vm->CurrentScript, &Co->Func->Code, true, Co);
+}
+
+NATIVE_FUNC(Yield)
+{
+    sl_call_frame *Frame = Vm->CurrentFrame;
+    sl_coroutine *Co = Frame->Coroutine;
+    if (Co)
+    {
+        if (ArgCount > 0)
+        {
+            StackPush(Vm, Args[0]);
+        }
+        else
+        {
+            StackPush(Vm, sl_value{});
+        }
+        Vm->CurrentFrame = Frame->Parent;
+        Co->Frame = Frame;
+    }
+    else
+    {
+        // @TODO: error
+    }
+}
+
+NATIVE_FUNC(Done)
+{
+    assert(ArgCount >= 1);
+    sl_coroutine *Co = Args[0].Coroutine;
+    if (Co->Frame)
+    {
+        StackPush(Vm, CreateBool(*(Co->Frame->CodePtr - 2) == OpCode_Return));
+    }
+    else
+    {
+        StackPush(Vm, CreateBool(false));
+    }
+}
+
 void InitVM(sl_vm *Vm)
 {
 #ifdef SL_DEBUG
     Vm->StringPool.DEBUGName = "StringPool";
+    Vm->CoroutinePool.DEBUGName = "CoroutinePool";
 #endif
 
     Vm->StringPool.ElemSize = sizeof(sl_string);
+    Vm->CoroutinePool.ElemSize = sizeof(sl_coroutine);
 
     RegisterNativeFunc(Vm, "+", Add, NULL);
     RegisterNativeFunc(Vm, "-", Sub, NULL);
@@ -1239,6 +1432,12 @@ void InitVM(sl_vm *Vm)
     RegisterNativeFunc(Vm, "/", Div, NULL);
     RegisterNativeFunc(Vm, "println", Println, NULL);
     RegisterNativeFunc(Vm, "read", Read, NULL);
+    RegisterNativeFunc(Vm, "if", If, NULL);
+    RegisterNativeFunc(Vm, "when", When, NULL);
+    RegisterNativeFunc(Vm, "coroutine", Coroutine, NULL);
+    RegisterNativeFunc(Vm, "call", Call, NULL);
+    RegisterNativeFunc(Vm, "yield", Yield, NULL);
+    RegisterNativeFunc(Vm, "done?", Done, NULL);
 }
 
 int main(int argc, char **argv)
